@@ -153,6 +153,10 @@ def setup_logging(verbose: bool = True):
     ensure_dirs()
     logger = logging.getLogger("dataloader")
     logger.setLevel(logging.INFO)
+    logger.propagate = False
+    # Avoid duplicate handlers if setup_logging is called multiple times
+    if logger.handlers:
+        logger.handlers.clear()
     formatter = logging.Formatter(fmt="%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
     # Rotating file handler
@@ -906,6 +910,7 @@ def live(logger: logging.Logger, chunk_size: int = CHUNK_SIZE):
     ensure_dirs()
     ex, resolved_symbol = create_exchange(logger)
     manifest = load_manifest()
+    stop = False
 
     if manifest.get("last_candle_ms") is None:
         logger.info("Manifest has no data yet. Starting initial backfill first...")
@@ -923,13 +928,17 @@ def live(logger: logging.Logger, chunk_size: int = CHUNK_SIZE):
     last_ms = int(manifest["last_candle_ms"])  # last closed candle time
 
     logger.info("Starting live updater. Will fetch any new klines every minute and maintain chunking.")
-    while True:  # pragma: no cover (long-running loop)
+    # Heartbeat to provide visibility even when there are no new klines
+    last_heartbeat_min = None
+    while not stop:  # pragma: no cover (long-running loop)
         try:
             # Target up to the last fully-closed candle
             target_end = utc_now_ms() - 60_000
             since_ms = last_ms + 60_000
             if since_ms <= target_end:
                 # Stream pages directly into chunk files without building a large in-memory list
+                behind_min = int((target_end - since_ms) / 60000) + 1 if target_end >= since_ms else 0
+                logger.info(f"New data available: catching up {behind_min} minute(s) from {ms_to_iso(since_ms)} to {ms_to_iso(target_end)}")
                 page_since = since_ms
                 # Work buffer that we will flush into chunk files; keep it bounded
                 work_buffer: Optional['pd.DataFrame'] = None
@@ -995,6 +1004,7 @@ def live(logger: logging.Logger, chunk_size: int = CHUNK_SIZE):
                         chunks_meta = manifest.get("chunks", [])
 
                         # If there is a partial chunk, append to it up to the remainder
+                        # Determine allowed size for the last day considering timezone switches (24 or 25 hours)
                         if chunks_meta and chunks_meta[-1]["count"] < chunk_size:
                             prev_path = os.path.join(DATA_ROOT, chunks_meta[-1]["filename"])  # type: ignore
                             prev_df = pd.read_parquet(prev_path)
@@ -1028,6 +1038,12 @@ def live(logger: logging.Logger, chunk_size: int = CHUNK_SIZE):
                             continue
 
                         # Otherwise, start a new chunk from remaining page_df (up to chunk_size)
+                        # HARD GUARD: do not start a new chunk if the last chunk is not yet full
+                        manifest = load_manifest()
+                        chunks_meta = manifest.get("chunks", [])
+                        if chunks_meta and int(chunks_meta[-1]["count"]) < chunk_size:
+                            # There is still a partial chunk; continue the while loop to append
+                            continue
                         take = min(chunk_size, len(page_df))
                         part = page_df.iloc[:take]
                         page_df = page_df.iloc[take:]
@@ -1077,13 +1093,33 @@ def live(logger: logging.Logger, chunk_size: int = CHUNK_SIZE):
                 # End while rows
             else:
                 logger.debug("Already up-to-date with last closed kline.")
+        except KeyboardInterrupt:
+            logger.info("Live updater stopped by user (KeyboardInterrupt). Shutting down gracefully...")
+            stop = True
+            break
         except Exception as e:
             logger.exception(f"Live updater error: {e}")
         # Periodic cleanup to keep memory low
         gc.collect()
+        # Heartbeat once per minute so the terminal shows activity even when up-to-date
         now = datetime.now(timezone.utc)
+        current_min = now.replace(second=0, microsecond=0)
+        if last_heartbeat_min != current_min:
+            last_heartbeat_min = current_min
+            logger.info(f"Heartbeat: up-to-date. Last candle: {ms_to_iso(last_ms)}; next check at {now.replace(second=0, microsecond=0) + timedelta(minutes=1)} UTC")
         sleep_sec = 60 - (now.second + now.microsecond / 1_000_000.0)
-        time.sleep(max(1.0, sleep_sec))
+        try:
+            time.sleep(max(1.0, sleep_sec))
+        except KeyboardInterrupt:
+            logger.info("Live updater sleep interrupted by user. Exiting...")
+            stop = True
+            break
+
+    # Cleanup exchange on exit from live
+    try:
+        ex.close() if hasattr(ex, 'close') else None
+    except Exception:
+        pass
 
 
 # --------------------------
@@ -1146,24 +1182,32 @@ def main(argv: Optional[List[str]] = None):
 
     logger = setup_logging(verbose=not args.quiet)
 
-    if args.cmd == "backfill":
-        start_ms = iso_to_ms(args.start) if args.start else iso_to_ms(START_ISO_UTC)
-        end_ms = iso_to_ms(args.end) if args.end else None
-        backfill(logger, start_ms=start_ms, end_ms=end_ms, chunk_size=args.chunk_size, align_window=True)
-    elif args.cmd == "live":
-        live(logger, chunk_size=args.chunk_size)
-    elif args.cmd == "verify":
-        ok = verify_continuity(logger, start_iso=args.start, end_iso=args.end, repair=args.repair)
-        sys.exit(0 if ok else 2)
-    elif args.cmd == "combine":
-        manifest = load_manifest()
-        out = build_combined_parquet(manifest, logger, from_index=args.from_index, to_index=args.to_index, tz_name=args.tz)
-        if out:
-            logger.info(f"Combined parquet built: {out}")
-        else:
-            logger.info("Combine skipped or failed.")
-    elif args.cmd == "status":
-        status(logger)
+    try:
+        if args.cmd == "backfill":
+            start_ms = iso_to_ms(args.start) if args.start else iso_to_ms(START_ISO_UTC)
+            end_ms = iso_to_ms(args.end) if args.end else None
+            backfill(logger, start_ms=start_ms, end_ms=end_ms, chunk_size=args.chunk_size, align_window=True)
+        elif args.cmd == "live":
+            live(logger, chunk_size=args.chunk_size)
+        elif args.cmd == "verify":
+            ok = verify_continuity(logger, start_iso=args.start, end_iso=args.end, repair=args.repair)
+            sys.exit(0 if ok else 2)
+        elif args.cmd == "combine":
+            manifest = load_manifest()
+            out = build_combined_parquet(manifest, logger, from_index=args.from_index, to_index=args.to_index, tz_name=args.tz)
+            if out:
+                logger.info(f"Combined parquet built: {out}")
+            else:
+                logger.info("Combine skipped or failed.")
+        elif args.cmd == "status":
+            status(logger)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user. Exiting.")
+        try:
+            # best-effort cleanup
+            pass
+        finally:
+            sys.exit(0)
 
 
 if __name__ == "__main__":
