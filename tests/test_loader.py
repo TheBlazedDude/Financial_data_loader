@@ -124,6 +124,35 @@ class LoaderBackfillTest(unittest.TestCase):
         # Verify continuity routine returns True
         self.assertTrue(loader.verify_continuity(self.logger))
 
+    def test_align_midnight_ms_handles_dst_transitions(self):
+        # Europe/Zurich: DST starts last Sunday in March (23-hour day) and ends last Sunday in October (25-hour day)
+        tz = "Europe/Zurich"
+        # Pick known dates: 2021-03-28 (spring forward), 2021-10-31 (fall back)
+        # Evaluate UTC span of a single local day boundary computed by align_midnight_ms
+        # Start with spring forward day - compute UTC ms for local 00:00 and next day 00:00
+        start_local_spring = loader.iso_to_ms("2021-03-28T00:00:00Z")  # placeholder; we will convert via function
+        # Instead pass any ms inside that day (noon UTC) so align_midnight_ms finds the day boundaries in tz
+        inside_spring_ms = loader.iso_to_ms("2021-03-28T12:00:00Z")
+        start_utc_ms = loader.align_midnight_ms(inside_spring_ms, tz, "start")
+        end_utc_ms_plus = loader.align_midnight_ms(inside_spring_ms, tz, "end") + 60_000  # end is last minute open; add 1 minute to get next midnight
+        # Duration in minutes should be 23 hours = 1380 minutes
+        duration_min_spring = int(round((end_utc_ms_plus - start_utc_ms) / 60000))
+        self.assertIn(duration_min_spring, (1380,))
+
+        # Fall back day
+        inside_fall_ms = loader.iso_to_ms("2021-10-31T12:00:00Z")
+        start_utc_ms_fall = loader.align_midnight_ms(inside_fall_ms, tz, "start")
+        end_utc_ms_plus_fall = loader.align_midnight_ms(inside_fall_ms, tz, "end") + 60_000
+        duration_min_fall = int(round((end_utc_ms_plus_fall - start_utc_ms_fall) / 60000))
+        self.assertIn(duration_min_fall, (1500,))
+
+        # For a fixed offset, the duration should always be 1440
+        tz_fixed = "+01:00"
+        start_fixed = loader.align_midnight_ms(inside_spring_ms, tz_fixed, "start")
+        end_fixed = loader.align_midnight_ms(inside_spring_ms, tz_fixed, "end") + 60_000
+        duration_min_fixed = int(round((end_fixed - start_fixed) / 60000))
+        self.assertEqual(duration_min_fixed, 1440)
+
 
     def test_chunk_loading_and_combination_correctness(self):
         # Define a window that yields 3 chunks with chunk_size=5: total 13 rows -> [5,5,3]

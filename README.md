@@ -50,7 +50,8 @@ Backfill historical data with defaults (market=futures, pair=BTC/USDT):
 `py binance_usdm_loader.py backfill`
 
 Backfill with custom time window and chunk size:
-`py binance_usdm_loader.py --market futures --pair BTC/USDT backfill --start 2020-01-01T01:00:00Z --end 2020-02-01T00:00:00Z --chunk-size 1440`
+`py binance_usdm_loader.py --market futures --pair BTC/USDT --align-tz Europe/Zurich backfill --start 2020-01-01T01:00:00Z --end 2020-02-01T00:00:00Z --chunk-size 1440`
+- Alignment: start/end are auto-aligned to 00:00-24:00 of the selected timezone (UTC by default). Storage is always UTC; each chunk corresponds to one local day (1440 1-minute rows).
 
 Run live updater (keeps appending the newest closed klines every minute):
 `py binance_usdm_loader.py --market spot --pair BTC/USDT live`
@@ -64,7 +65,7 @@ Verify continuity across chunks using the manifest:
 Show status:
 `py binance_usdm_loader.py status`
 
-Combined Parquet (optional) — BUILD_COMBINED_ON_BACKFILL
+Combined Parquet (optional) — BUILD_COMBINED_ON_BACKFILL and 'combine' command
 - By default, combined Parquet is NOT rebuilt at the end of backfill to avoid long blocking jobs and memory/IO spikes.
 - You can enable automatic combined rebuild after backfill by setting the environment variable BUILD_COMBINED_ON_BACKFILL.
   Where to set it:
@@ -80,6 +81,49 @@ Examples:
   (remove with `Remove-Item Env:BUILD_COMBINED_ON_BACKFILL`)
 - Incremental combine from Python REPL (from_index defines the start, to_index defines end if given, else till up to date):
   `import binance_usdm_loader as l; m = l.load_manifest(); l.build_combined_parquet(m, l.setup_logging(), from_index=2000, to_index=2067)`
+- Manual combine via CLI with timezone suffix on filename:
+  `py binance_usdm_loader.py combine --tz Europe/Zurich`
+  or with indices: `py binance_usdm_loader.py combine --from-index 1 --to-index 100 --tz +02:00`
+
+Timezone alignment for windows and live:
+- Use --align-tz to align start/end to midnight of your local market time (default UTC). Example:
+  `py binance_usdm_loader.py --align-tz Europe/Zurich backfill --start 2021-01-10 --end 2021-01-20`
+  The data remains stored in UTC and chunked as full local-days (always 1440 1-minute candles).
+
+Supported timezone formats and examples:
+- Fixed numeric UTC offsets (no DST):
+  - +00:00 (UTC), +01:00 (Europe/Zurich winter, Europe/Berlin winter), +02:00 (Helsinki/Athens or Central Europe summer),
+    -04:00 (America/Halifax; also New York during summer is -04:00),
+    -05:00 (America/New_York winter), -07:00 (America/Los_Angeles summer), +09:00 (Asia/Tokyo, no DST), etc.
+
+Mapping examples (offset ⇄ typical zone at that offset on given season):
+- UTC +00:00 → UTC, Europe/London (winter)
+- UTC +01:00 → Europe/Zurich (winter), Europe/Berlin (winter), Europe/London (summer)
+- UTC +02:00 → Europe/Zurich (summer), Europe/Berlin (summer), Africa/Cairo (no DST currently), Asia/Jerusalem (winter)
+- UTC -05:00 → America/New_York (winter), America/Chicago (summer)
+- UTC -06:00 → America/Chicago (winter), America/Denver (summer)
+- UTC -07:00 → America/Denver (winter), America/Los_Angeles (summer)
+- UTC -08:00 → America/Los_Angeles (winter)
+- UTC +09:00 → Asia/Tokyo (year-round), Asia/Seoul (year-round)
+
+Notes:
+- IANA zones are recommended because fixed numeric offsets do not account for daylight saving time changes. If you use +02:00, it will always align to +02:00 even when your market switches to +01:00 or +03:00 seasonally.
+
+Daylight Saving Time (DST) behavior:
+- What changes: Many markets shift their offset twice per year (e.g., Europe/Zurich switches between +01:00 winter and +02:00 summer). On the spring-forward date, the local day has 23 hours; on the fall-back date, it has 25 hours.
+- How the loader handles it: When you use an IANA zone (e.g., Europe/Zurich, America/New_York), the loader aligns start/end to local midnights in that zone, converts to UTC, and stores in UTC. This automatically yields 23h or 25h spans on the two transition days, with all minute bars preserved in UTC.
+- Fixed-offset caveat: If you choose a fixed offset like +02:00, the offset never changes. Your local “day” will always be 24h, which may not match your market’s actual trading day during DST season changes.
+- Recommendation: Prefer IANA timezone names for market-aligned windows. Use fixed offsets only if you explicitly want a constant offset regardless of DST.
+
+Usage examples with other timezones:
+- Align to New York trading day:
+  `py binance_usdm_loader.py --align-tz America/New_York backfill --start 2021-01-10 --end 2021-01-20`
+- Align to Tokyo trading day:
+  `py binance_usdm_loader.py --align-tz Asia/Tokyo backfill --start 2021-01-10 --end 2021-01-20`
+- Combine with explicit offset in filename suffix:
+  `py binance_usdm_loader.py combine --tz America/Los_Angeles`
+  or
+  `py binance_usdm_loader.py combine --tz +02:00`
 
 Notes
 - The loader writes Parquet chunks with Zstandard compression. For analytics, read them with pandas.read_parquet.

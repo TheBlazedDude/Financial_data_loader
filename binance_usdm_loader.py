@@ -7,7 +7,7 @@ import hashlib
 import logging
 import gc
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
 try:
@@ -40,7 +40,7 @@ MARKET_TYPE = os.environ.get("MARKET_TYPE", "futures")  # futures | spot
 EXCHANGE_ID = "binanceusdm" if MARKET_TYPE == "futures" else "binance"
 SYMBOL = "BTC/USDT"  # Symbol name (ccxt format)
 TIMEFRAME = "1m"
-START_ISO_UTC = "2020-01-01T01:00:00Z"  # starting at 01.01.2020 01:00 UTC
+START_ISO_UTC = "2020-01-01T00:00:00Z"  # starting at 01.01.2020 00:00 UTC
 # Legacy OHLCV limit (not used for klines anymore)
 LIMIT = 1000
 # Binance klines max limit per request
@@ -82,6 +82,66 @@ EXTRA_SLEEP_SEC = 0.0  # keep 0 by default; adjust if needed
 # --------------------------
 # Helpers
 # --------------------------
+
+# Timezone and alignment
+ALIGN_TZ = os.environ.get("ALIGN_TZ", "UTC")  # IANA tz name or fixed offset like UTC
+
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
+
+
+def _tzinfo(name: str):
+    if name.upper() in ("UTC", "Z"):
+        return timezone.utc
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    # Fallback: fixed offset like +02:00 or -0500
+    try:
+        s = name.replace(" ", "")
+        if s.startswith("+") or s.startswith("-"):
+            sign = 1 if s[0] == "+" else -1
+            hh, mm = 0, 0
+            if ":" in s:
+                hh, mm = s[1:].split(":", 1)
+            else:
+                if len(s) in (3, 5):  # +HH or +HHMM
+                    hh = s[1:3]
+                    mm = s[3:] if len(s) == 5 else "0"
+            return timezone(sign * timedelta(hours=int(hh or 0), minutes=int(mm or 0)))
+    except Exception:
+        pass
+    return timezone.utc
+
+
+def align_midnight_ms(ms: int, tz_name: str, to: str) -> int:
+    """Align a UTC ms timestamp to midnight boundary of given tz.
+    to: 'floor' -> 00:00 of that day; 'ceil' -> next day's 00:00 unless already at 00:00; 'start' -> same as floor; 'end' -> last minute 23:59 for inclusive windows
+    Returns UTC ms.
+    """
+    tz = _tzinfo(tz_name)
+    dt_utc = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    dt_local = dt_utc.astimezone(tz)
+    if to in ("floor", "start"):
+        aligned_local = datetime(dt_local.year, dt_local.month, dt_local.day, tzinfo=tz)
+        return int(aligned_local.astimezone(timezone.utc).timestamp() * 1000)
+    elif to == "ceil":
+        is_midnight = (dt_local.hour == 0 and dt_local.minute == 0 and dt_local.second == 0 and dt_local.microsecond == 0)
+        base = dt_local if is_midnight else (datetime(dt_local.year, dt_local.month, dt_local.day, tzinfo=tz) + timedelta(days=1))
+        aligned_local = base if is_midnight else base
+        return int(aligned_local.astimezone(timezone.utc).timestamp() * 1000)
+    elif to == "end":
+        # Inclusive window end ms at 23:59:00 of local day -> last candle open
+        start_local = datetime(dt_local.year, dt_local.month, dt_local.day, tzinfo=tz)
+        end_local = start_local + timedelta(days=1)  # next midnight
+        end_utc_ms = int(end_local.astimezone(timezone.utc).timestamp() * 1000) - 60_000
+        return end_utc_ms
+    else:
+        return ms
 
 def ensure_dirs():
     os.makedirs(CHUNKS_DIR, exist_ok=True)
@@ -343,7 +403,7 @@ def append_to_combined(df: 'pd.DataFrame', logger: logging.Logger):
     logger.info(f"Appended {len(df)} rows to dataset (Parquet chunks); combined file maintenance is optional and can be enabled via BUILD_COMBINED_ON_BACKFILL or external compaction.")
 
 
-def build_combined_parquet(manifest: Dict[str, Any], logger: logging.Logger, from_index: Optional[int] = None, to_index: Optional[int] = None) -> Optional[str]:
+def build_combined_parquet(manifest: Dict[str, Any], logger: logging.Logger, from_index: Optional[int] = None, to_index: Optional[int] = None, tz_name: Optional[str] = None) -> Optional[str]:
     """Build a single combined Parquet file from all existing chunk Parquet files.
     Uses pyarrow.ParquetWriter to stream row groups and avoid high memory usage.
     Returns the combined file path on success, or None if skipped/failure.
@@ -364,8 +424,13 @@ def build_combined_parquet(manifest: Dict[str, Any], logger: logging.Logger, fro
         return None
 
     os.makedirs(COMBINED_DIR, exist_ok=True)
-    combined_tmp = os.path.join(COMBINED_DIR, f"{PAIR_TOKEN}_{TIMEFRAME}_all.tmp.parquet")
-    combined_path = COMBINED_FILE
+    tz_label = None
+    if tz_name:
+        # Build filesystem-safe label, e.g., Europe_Zurich or UTC_plus02
+        safe = tz_name.replace('/', '_').replace(':', '')
+        tz_label = safe
+    combined_tmp = os.path.join(COMBINED_DIR, f"{PAIR_TOKEN}_{TIMEFRAME}_all{('_' + tz_label) if tz_label else ''}.tmp.parquet")
+    combined_path = os.path.join(COMBINED_DIR, f"{PAIR_TOKEN}_{TIMEFRAME}_all{('_' + tz_label) if tz_label else ''}.parquet")
 
     # Remove temp file if it exists
     try:
@@ -512,7 +577,8 @@ def fetch_klines_page(ex, symbol: str, timeframe: str, since_ms: int, limit: int
 def backfill(logger: logging.Logger,
              start_ms: Optional[int] = None,
              end_ms: Optional[int] = None,
-             chunk_size: int = CHUNK_SIZE):
+             chunk_size: int = CHUNK_SIZE,
+             align_window: Optional[bool] = None):
     ensure_dirs()
     if pd is None:
         raise RuntimeError("pandas is required. Please install dependencies from requirements.txt")
@@ -526,12 +592,21 @@ def backfill(logger: logging.Logger,
     manifest["columns"] = KLINE_COLUMNS
     save_manifest(manifest)
 
-    # Determine requested window
+    # Determine requested window (UTC), then align to chosen timezone midnight boundaries
     request_start_ms = iso_to_ms(START_ISO_UTC) if start_ms is None else start_ms
     if end_ms is None:
         request_end_ms = utc_now_ms() - 60_000  # up to last fully closed minute
     else:
         request_end_ms = end_ms
+    # Decide whether to auto-align window to midnight boundaries. Default: align only when invoked via CLI without explicit ms
+    do_align = False
+    if align_window is True:
+        do_align = True
+    elif align_window is None and start_ms is None and end_ms is None:
+        do_align = True
+    if do_align:
+        request_start_ms = align_midnight_ms(request_start_ms, ALIGN_TZ, "start")
+        request_end_ms = align_midnight_ms(request_end_ms, ALIGN_TZ, "end")
 
     # Compute missing intervals relative to existing chunks
     chunks_meta = manifest.get("chunks", [])
@@ -579,10 +654,28 @@ def backfill(logger: logging.Logger,
             buffer.extend(rows)
             total_added += len(rows)
 
-            # If we exceeded chunk size, flush full chunks out of buffer
-            while len(buffer) >= chunk_size:
-                chunk = buffer[:chunk_size]
-                buffer = buffer[chunk_size:]
+            # If we exceeded chunk size OR boundary crossed, flush full days aligned to ALIGN_TZ
+            def boundary_index(buf: List[List[Any]]) -> int:
+                if not buf:
+                    return 0
+                # Find last index such that next open_time belongs to next local day
+                tz = _tzinfo(ALIGN_TZ)
+                for i in range(len(buf)-1):
+                    t0 = buf[i][0]
+                    t1 = buf[i+1][0]
+                    d0 = datetime.fromtimestamp(t0/1000, tz=timezone.utc).astimezone(tz)
+                    d1 = datetime.fromtimestamp(t1/1000, tz=timezone.utc).astimezone(tz)
+                    if (d0.date() != d1.date()):
+                        return i+1
+                return 0
+            # Flush as many full days (or chunk_size groups) as available
+            while True:
+                bidx = boundary_index(buffer)
+                if bidx == 0 and len(buffer) < chunk_size:
+                    break
+                take = bidx if bidx > 0 else chunk_size
+                chunk = buffer[:take]
+                buffer = buffer[take:]
                 df = pd.DataFrame(chunk, columns=KLINE_COLUMNS)  # type: ignore
                 start_ms_chunk = int(df.iloc[0]["open_time"])  # type: ignore
                 end_ms_chunk = int(df.iloc[-1]["open_time"])  # type: ignore
@@ -762,7 +855,7 @@ def verify_continuity(logger: logging.Logger, start_iso: Optional[str] = None, e
         # Trigger backfill from the missing minute up to window_end_ms
         target_end = window_end_ms if end_iso else (utc_now_ms() - 60_000)
         logger.info(f"Re-collecting from {ms_to_iso(gap_found_at)} to {ms_to_iso(target_end)}...")
-        backfill(logger, start_ms=gap_found_at, end_ms=target_end, chunk_size=manifest.get("chunk_size", CHUNK_SIZE))
+        backfill(logger, start_ms=gap_found_at, end_ms=target_end, chunk_size=manifest.get("chunk_size", CHUNK_SIZE), align_window=False)
         # Re-verify quickly
         manifest = load_manifest()
         chunks = sorted(manifest.get("chunks", []), key=lambda c: c["index"])
@@ -816,7 +909,7 @@ def live(logger: logging.Logger, chunk_size: int = CHUNK_SIZE):
 
     if manifest.get("last_candle_ms") is None:
         logger.info("Manifest has no data yet. Starting initial backfill first...")
-        backfill(logger, chunk_size=chunk_size)
+        backfill(logger, chunk_size=chunk_size, align_window=False)
         manifest = load_manifest()
 
     # Always ensure we are fully caught up to now by computing gaps from last_candle_ms to last closed minute
@@ -824,7 +917,7 @@ def live(logger: logging.Logger, chunk_size: int = CHUNK_SIZE):
     request_start = int(manifest.get("last_candle_ms", 0)) + 60_000
     if request_start <= target_end:
         logger.info(f"Live mode pre-sync: filling gaps from {ms_to_iso(request_start)} to {ms_to_iso(target_end)} before starting the minute loop")
-        backfill(logger, start_ms=request_start, end_ms=target_end, chunk_size=chunk_size)
+        backfill(logger, start_ms=request_start, end_ms=target_end, chunk_size=chunk_size, align_window=False)
         manifest = load_manifest()
 
     last_ms = int(manifest["last_candle_ms"])  # last closed candle time
@@ -1006,6 +1099,7 @@ def _parse_args(argv: List[str]):
     p.add_argument("--market", choices=["spot", "futures"], default=MARKET_TYPE, help="Market type: spot (Binance) or futures (Binance USDM)")
     p.add_argument("--pair", default=SYMBOL, help="Trading pair in CCXT format, e.g., BTC/USDT. Will fall back to BTC/USDT if unavailable.")
     p.add_argument("--quiet", action="store_true", help="Reduce console logging")
+    p.add_argument("--align-tz", default=os.environ.get("ALIGN_TZ", "UTC"), help="Alignment timezone for start/end day boundaries (IANA name like Europe/Zurich or offset like +02:00). Storage is always UTC.")
 
     p_backfill = sub.add_parser("backfill", help="Run historical backfill")
     p_backfill.add_argument("--start", help="Start ISO time (UTC). Default 2020-01-01T01:00:00Z", default=START_ISO_UTC)
@@ -1019,6 +1113,12 @@ def _parse_args(argv: List[str]):
     p_verify.add_argument("--start", help="Optional start ISO (UTC) for verification window", default=None)
     p_verify.add_argument("--end", help="Optional end ISO (UTC) for verification window", default=None)
     p_verify.add_argument("--repair", action="store_true", help="If set, will delete bad tail and backfill from first gap")
+
+    p_combine = sub.add_parser("combine", help="Combine all chunk Parquet files into a single Parquet; filename annotated with timezone label")
+    p_combine.add_argument("--from-index", type=int, default=None, help="Optional first chunk index to include")
+    p_combine.add_argument("--to-index", type=int, default=None, help="Optional last chunk index to include")
+    p_combine.add_argument("--tz", default=os.environ.get("VIEW_TZ", None), help="Timezone label for filename (e.g., Europe/Zurich or +02:00). If omitted, no tz suffix.")
+
     sub.add_parser("status", help="Print current status from manifest")
 
     return p.parse_args(argv)
@@ -1034,6 +1134,9 @@ def main(argv: Optional[List[str]] = None):
     # Normalize pair
     SYMBOL = args.pair.replace(" ", "").replace("-", "/").upper()
     PAIR_TOKEN = _symbol_to_pair_token(SYMBOL)
+    # Apply alignment timezone for this session
+    global ALIGN_TZ
+    ALIGN_TZ = args.align_tz
     # Recompute data paths based on market and pair
     DATA_ROOT = os.path.join("data", EXCHANGE_ID, PAIR_TOKEN, TIMEFRAME)
     CHUNKS_DIR = os.path.join(DATA_ROOT, "chunks")
@@ -1046,12 +1149,19 @@ def main(argv: Optional[List[str]] = None):
     if args.cmd == "backfill":
         start_ms = iso_to_ms(args.start) if args.start else iso_to_ms(START_ISO_UTC)
         end_ms = iso_to_ms(args.end) if args.end else None
-        backfill(logger, start_ms=start_ms, end_ms=end_ms, chunk_size=args.chunk_size)
+        backfill(logger, start_ms=start_ms, end_ms=end_ms, chunk_size=args.chunk_size, align_window=True)
     elif args.cmd == "live":
         live(logger, chunk_size=args.chunk_size)
     elif args.cmd == "verify":
         ok = verify_continuity(logger, start_iso=args.start, end_iso=args.end, repair=args.repair)
         sys.exit(0 if ok else 2)
+    elif args.cmd == "combine":
+        manifest = load_manifest()
+        out = build_combined_parquet(manifest, logger, from_index=args.from_index, to_index=args.to_index, tz_name=args.tz)
+        if out:
+            logger.info(f"Combined parquet built: {out}")
+        else:
+            logger.info("Combine skipped or failed.")
     elif args.cmd == "status":
         status(logger)
 
