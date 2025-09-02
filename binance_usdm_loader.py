@@ -667,24 +667,126 @@ def backfill(logger: logging.Logger,
     gc.collect()
 
 
-def verify_continuity(logger: logging.Logger) -> bool:
-    """Verify that the manifest records continuous 1-minute data across chunks."""
+def verify_continuity(logger: logging.Logger, start_iso: Optional[str] = None, end_iso: Optional[str] = None, repair: bool = False) -> bool:
+    """Verify that the dataset has every 1-minute candle without gaps.
+
+    Checks both intra-chunk spacing and cross-chunk boundaries. Optionally restricts
+    verification to a given [start,end] ISO window. If repair=True, removes all chunks
+    from the first detected gap onward and triggers backfill to re-collect from the
+    missing minute up to end (or last closed minute if end not provided).
+    """
     manifest = load_manifest()
     chunks = sorted(manifest.get("chunks", []), key=lambda c: c["index"])
-    prev_end = None
-    ok = True
+    if not chunks:
+        logger.info("No chunks present; nothing to verify.")
+        return True
+
+    # Parse window in ms if provided
+    window_start_ms = iso_to_ms(start_iso) if start_iso else chunks[0]["start_ms"]
+    window_end_ms = iso_to_ms(end_iso) if end_iso else int(manifest.get("last_candle_ms") or chunks[-1]["end_ms"])  # type: ignore
+
+    gap_found_at: Optional[int] = None
+
+    # Verify intra-chunk spacing and locate first gap inside window
     for ch in chunks:
+        # Skip chunks outside window
+        if ch["end_ms"] < window_start_ms or ch["start_ms"] > window_end_ms:
+            continue
+        # Load parquet and check 1m diffs
+        try:
+            path = os.path.join(DATA_ROOT, ch["filename"])  # type: ignore
+            if not os.path.exists(path):
+                logger.error(f"Missing chunk file on disk: {path}")
+                gap_found_at = gap_found_at or ch["start_ms"]
+                break
+            df = pd.read_parquet(path) if pd is not None else None
+            if df is not None and len(df) > 1:
+                diffs = df["open_time"].diff().dropna().astype(int)
+                if not (diffs == 60_000).all():
+                    # Find first bad index
+                    bad_idx = diffs[diffs != 60_000].index[0]
+                    gap_found_at = gap_found_at or int(df.iloc[bad_idx]["open_time"]) - 60_000
+                    logger.error(f"Intra-chunk gap detected in chunk {ch['index']} around {ms_to_iso(int(df.iloc[bad_idx]['open_time']))}")
+                    break
+        except Exception as e:
+            logger.error(f"Failed to read/verify chunk {ch['index']}: {e}")
+            gap_found_at = gap_found_at or ch["start_ms"]
+            break
+
+    # Verify cross-chunk boundaries
+    prev_end = None
+    for ch in chunks:
+        if ch["end_ms"] < window_start_ms or ch["start_ms"] > window_end_ms:
+            continue
         if prev_end is None:
             prev_end = ch["end_ms"]
             continue
         expected = prev_end + 60_000
         if ch["start_ms"] != expected:
             logger.error(f"Continuity error between chunks {ch['index']-1} and {ch['index']}: expected start {expected} got {ch['start_ms']}")
-            ok = False
+            gap_found_at = gap_found_at or expected
+            break
         prev_end = ch["end_ms"]
-    if ok:
-        logger.info("Continuity verified across chunks.")
-    return ok
+
+    if gap_found_at is None:
+        logger.info("Continuity verified: no gaps found in requested window.")
+        return True
+
+    # If repair requested, remove bad tail and backfill from gap_found_at
+    if repair:
+        logger.warning(f"Repair requested. Will remove chunks from first affected at/after {ms_to_iso(gap_found_at)} and re-download.")
+        # Determine first affected chunk index
+        first_bad_idx = None
+        for ch in chunks:
+            if ch["end_ms"] >= gap_found_at:
+                first_bad_idx = ch["index"]
+                break
+        if first_bad_idx is None:
+            first_bad_idx = chunks[-1]["index"]
+        # Delete files and trim manifest
+        kept = []
+        for ch in chunks:
+            if ch["index"] < first_bad_idx:
+                kept.append(ch)
+            else:
+                try:
+                    path = os.path.join(DATA_ROOT, ch["filename"])  # type: ignore
+                    if os.path.exists(path):
+                        os.remove(path)
+                        logger.info(f"Deleted chunk file during repair: {path}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete chunk during repair: {e}")
+        manifest["chunks"] = kept
+        manifest["last_candle_ms"] = kept[-1]["end_ms"] if kept else None
+        save_manifest(manifest)
+        # Trigger backfill from the missing minute up to window_end_ms
+        target_end = window_end_ms if end_iso else (utc_now_ms() - 60_000)
+        logger.info(f"Re-collecting from {ms_to_iso(gap_found_at)} to {ms_to_iso(target_end)}...")
+        backfill(logger, start_ms=gap_found_at, end_ms=target_end, chunk_size=manifest.get("chunk_size", CHUNK_SIZE))
+        # Re-verify quickly
+        manifest = load_manifest()
+        chunks = sorted(manifest.get("chunks", []), key=lambda c: c["index"])
+        ok = True
+        prev_end = None
+        for ch in chunks:
+            if ch["end_ms"] < window_start_ms or ch["start_ms"] > target_end:
+                continue
+            if prev_end is None:
+                prev_end = ch["end_ms"]
+                continue
+            expected = prev_end + 60_000
+            if ch["start_ms"] != expected:
+                ok = False
+                break
+            prev_end = ch["end_ms"]
+        if ok:
+            logger.info("Repair complete and continuity re-verified.")
+        else:
+            logger.error("Repair attempted but continuity still broken.")
+        return ok
+
+    # No repair; just report failure
+    return False
 
 
 def status(logger: logging.Logger):
@@ -913,7 +1015,10 @@ def _parse_args(argv: List[str]):
     p_live = sub.add_parser("live", help="Run continuous live updater (will trigger backfill if needed)")
     p_live.add_argument("--chunk-size", type=int, default=CHUNK_SIZE)
 
-    sub.add_parser("verify", help="Verify continuity across chunks")
+    p_verify = sub.add_parser("verify", help="Verify continuity across chunks and within chunks; optionally repair")
+    p_verify.add_argument("--start", help="Optional start ISO (UTC) for verification window", default=None)
+    p_verify.add_argument("--end", help="Optional end ISO (UTC) for verification window", default=None)
+    p_verify.add_argument("--repair", action="store_true", help="If set, will delete bad tail and backfill from first gap")
     sub.add_parser("status", help="Print current status from manifest")
 
     return p.parse_args(argv)
@@ -945,7 +1050,7 @@ def main(argv: Optional[List[str]] = None):
     elif args.cmd == "live":
         live(logger, chunk_size=args.chunk_size)
     elif args.cmd == "verify":
-        ok = verify_continuity(logger)
+        ok = verify_continuity(logger, start_iso=args.start, end_iso=args.end, repair=args.repair)
         sys.exit(0 if ok else 2)
     elif args.cmd == "status":
         status(logger)

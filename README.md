@@ -36,6 +36,11 @@ Usage
 Show CLI help:
 `py binance_usdm_loader.py --help`
 
+If "py" is not recognized on your system, use one of the following instead:
+- `python binance_usdm_loader.py --help`
+- `python -m binance_usdm_loader --help`
+- PowerShell venv (example): `.\\.venv\\Scripts\\python.exe binance_usdm_loader.py --help`
+
 Select market and pair (examples):
 - Spot BTC/USDT backfill: py binance_usdm_loader.py --market spot --pair BTC/USDT backfill
 - Futures BTC/USDT backfill: py binance_usdm_loader.py --market futures --pair BTC/USDT backfill
@@ -52,6 +57,9 @@ Run live updater (keeps appending the newest closed klines every minute):
 
 Verify continuity across chunks using the manifest:
 `py binance_usdm_loader.py verify`
+- Advanced: verify a specific window and optionally repair gaps by re-collecting from the first missing minute onward:
+  - Verify only: `py binance_usdm_loader.py verify --start 2021-01-01T00:00:00Z --end 2021-01-10T00:00:00Z`
+  - Verify and repair: `py binance_usdm_loader.py verify --start 2021-01-01T00:00:00Z --end 2021-01-10T00:00:00Z --repair`
 
 Show status:
 `py binance_usdm_loader.py status`
