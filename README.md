@@ -10,11 +10,13 @@ Overview
 - Memory-safe: at most a single active chunk is in memory; all I/O is streamed to disk.
 
 Key Paths
-- Data root: data\<exchange_id>\<PAIR_TOKEN>\1m\ (e.g., data\binanceusdm\BTCUSDT\1m\ or data\binance\BTCUSDT\1m\)
-  - chunks\chunk_000001_...parquet, chunk_000002_...parquet, ...
-  - manifest.json
-  - combined\<PAIR_TOKEN>_1m_all.parquet (e.g., combined\BTCUSDT_1m_all.parquet)
-- Logs: logs\loader.log (rotating)
+- Data root: By default outside the project to avoid IDE indexing: C:\\MarketData\\<exchange_id>\\<PAIR_TOKEN>\\1m\\
+  - You can override with environment variable MARKET_DATA_DIR (Windows PowerShell example: `$Env:MARKET_DATA_DIR = "C:\\MarketData"`)
+  - Example: C:\\MarketData\\binanceusdm\\BTCUSDT\\1m\\ or C:\\MarketData\\binance\\BTCUSDT\\1m\\
+  - chunks\\chunk_000001_...parquet, chunk_000002_...parquet, ...
+  - manifest.json (written atomically, debounced)
+  - combined\\<PAIR_TOKEN>_1m_all.parquet (e.g., combined\\BTCUSDT_1m_all.parquet)
+- Logs: logs\\loader.log (rotating)
 
 Rate Limits and Stability
 - Uses ccxt with enableRateLimit to comply with Binance limits (each request up to 1500 klines):
@@ -54,7 +56,11 @@ Backfill with custom time window and chunk size:
 - Alignment: start/end are auto-aligned to 00:00-24:00 of the selected timezone (UTC by default). Storage is always UTC; each chunk corresponds to one local day (1440 1-minute rows).
 
 Run live updater (keeps appending the newest closed klines every minute):
-`py binance_usdm_loader.py --market spot --pair BTC/USDT live`
+`py binance_usdm_loader.py --market spot --pair BTC/USDT live`   
+
+Tip to keep IDE responsive:
+- Set MARKET_DATA_DIR to a directory outside your project (e.g., C:\\MarketData) so the IDE doesn’t index frequent writes.
+- Manifest writes are debounced by default (MANIFEST_WRITE_INTERVAL_SEC=300). You can adjust via env var, e.g. `$Env:MANIFEST_WRITE_INTERVAL_SEC = "600"`.
 
 Verify continuity across chunks using the manifest:
 `py binance_usdm_loader.py verify`

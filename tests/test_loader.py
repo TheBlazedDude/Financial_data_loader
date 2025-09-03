@@ -44,6 +44,11 @@ class LoaderBackfillTest(unittest.TestCase):
 
     def tearDown(self):
         try:
+            # Ensure logging handlers are closed to avoid ResourceWarnings
+            try:
+                loader.shutdown_logging()
+            except Exception:
+                pass
             shutil.rmtree(self.tempdir)
         except Exception:
             pass
