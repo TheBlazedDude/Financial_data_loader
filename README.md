@@ -1,6 +1,7 @@
 Financial Data Loader (Binance Spot or USDM Futures, 1m)
 
 Overview
+- Provides both a CLI and a lightweight HTTP API (FastAPI) to run in Docker and trigger jobs remotely.
 - Loads 1-minute klines (12 fields) from Binance Spot or Binance USDM Futures via ccxt raw API.
 - Supports any trading pair (default BTC/USDT). If the requested pair is unavailable on the selected market, it automatically falls back to BTC/USDT.
 - Historical backfill starting from 2020-01-01 01:00 UTC by default.
@@ -17,6 +18,7 @@ Key Paths
   - manifest.json (written atomically, debounced)
   - combined\\<PAIR_TOKEN>_1m_all.parquet (e.g., combined\\BTCUSDT_1m_all.parquet)
 - Logs: logs\\loader.log (rotating)
+  - On Windows PowerShell, when mounting the logs directory, use ${PWD}\\logs (not %CD%\\logs which is for cmd.exe).
 
 Rate Limits and Stability
 - Uses ccxt with enableRateLimit to comply with Binance limits (each request up to 1500 klines):
@@ -37,6 +39,41 @@ Installation
 Usage
 Show CLI help:
 `py binance_usdm_loader.py --help`
+
+Use as a Dockerized background API or sidecar (recommended for integration):
+- Build: `docker build -t financial-loader .`
+- Run (Windows PowerShell): `docker run -d -p 8000:8000 -v C:\\MarketData:/data/MarketData -v ${PWD}\\logs:/app/logs --name financial-loader financial-loader`
+  - Windows cmd.exe (not PowerShell): `docker run -d -p 8000:8000 -v C:\\MarketData:/data/MarketData -v %CD%\\logs:/app/logs --name financial-loader financial-loader`
+  - WSL/Linux/macOS: `docker run -d -p 8000:8000 -v /mnt/c/MarketData:/data/MarketData -v $PWD/logs:/app/logs --name financial-loader financial-loader`
+Environment variables (defaults in Dockerfile):
+- MARKET_DATA_DIR=/data/MarketData (mount your host directory here)
+- ALIGN_TZ=UTC (default alignment timezone; can be overridden per request)
+- MARKET_TYPE=futures and SYMBOL=BTC/USDT (defaults used if not overridden)
+- BUILD_COMBINED_ON_BACKFILL=0, MANIFEST_WRITE_INTERVAL_SEC=300
+
+- Endpoints:
+  - POST /backfill
+    - JSON body fields: start, end, chunk_size, align_window, tz, market, pair
+    - Example: {"start":"2020-01-01T00:00:00Z","end":"2020-02-01T00:00:00Z","chunk_size":1440,"align_window":true,"tz":"Europe/Zurich","market":"futures","pair":"ETH/USDT"}
+  - POST /live?tz=Europe/Zurich&market=futures&pair=BTC/USDT
+  - POST /combine?tz=Europe/Zurich or /combine?from_index=1&to_index=100&tz=+02:00 (also accepts market and pair query params)
+  - GET /health
+  - GET / — redirects to /browse (default landing page)
+  - GET /browse — HTML browser to choose market (spot=futures) and list all pairs under MarketData following binance/binanceusdm structure. Double‑click a file to open a new tab with a table preview; or click the view link to open it.
+    - GET /browse/file?file=relative/path/to/parquet&limit=200&offset=0
+- Example call (PowerShell): `Invoke-WebRequest -Method POST -Uri http://localhost:8000/backfill -Body '{"start":"2020-01-01T00:00:00Z","end":"2020-01-05T00:00:00Z","tz":"Europe/Zurich"}' -ContentType 'application/json'`
+
+Inside-container quick test commands (no HTTP):
+- docker exec -it financial-loader python -m container_tools --market futures --pair BTC/USDT backfill --start 2020-01-01 --end 2020-01-03
+- docker exec -it financial-loader python -m container_tools --market futures --pair ETH/USDT live --minutes 2
+- docker exec -it financial-loader python -m container_tools --market spot --pair SOL/USDT combine --tz Europe/Zurich
+- docker exec -it financial-loader python -m container_tools --market futures --pair BTC/USDT status
+- docker exec -it financial-loader python -m container_tools --market spot --pair BTC/USDT health
+
+You can also override the container command to run a one-off test:
+- Windows PowerShell: `docker run --rm -e MARKET_DATA_DIR=/data/MarketData -v C:\\MarketData:/data/MarketData -v ${PWD}\\logs:/app/logs financial-loader python -m container_tools status`
+- Windows cmd.exe: `docker run --rm -e MARKET_DATA_DIR=/data/MarketData -v C:\\MarketData:/data/MarketData -v %CD%\\logs:/app/logs financial-loader python -m container_tools status`
+- WSL/Linux/macOS: `docker run --rm -e MARKET_DATA_DIR=/data/MarketData -v /mnt/c/MarketData:/data/MarketData -v $PWD/logs:/app/logs financial-loader python -m container_tools status`
 
 If "py" is not recognized on your system, use one of the following instead:
 - `python binance_usdm_loader.py --help`
@@ -156,3 +193,19 @@ Caveats
 - Live mode only appends fully-closed klines (one-minute bars). It waits near minute boundaries.
 - If a requested pair does not exist on the selected market (spot/futures), the loader logs a warning and falls back to BTC/USDT.
 - If Binance returns gaps due to temporary outages, retries/backoff handle most cases; you can re-run backfill to fill potential gaps.
+
+
+Use as a base image in your own Dockerfile (optional):
+- Example:
+  FROM financial-loader as loader
+  # Your other services / app layers
+  # At runtime, run loader as a sidecar container and call its HTTP API from your app or CI to trigger backfill/live/combine.
+
+Troubleshooting tips
+- If you run `docker exec` commands inside the container shell, they will fail with errors like "/bin/sh: 1: docker: not found". Exit the container shell (`exit`) and run `docker exec ...` from your host.
+
+Troubleshooting volume mounts on Windows
+- If you see an error like `%!C(string=is not a valid Windows path)D%!(MISSING)\logs`, you likely used cmd.exe syntax (%CD%) in PowerShell. Use `${PWD}\logs` in PowerShell.
+- Ensure the host path exists before mounting. Create directories: `New-Item -ItemType Directory C:\MarketData, .\logs` in PowerShell.
+- Verify mounts from inside the container: `docker exec -it financial-loader sh -lc "ls -la /data/MarketData && ls -la /app/logs"` (or use a shell available in your base image).
+- On WSL, map Windows drive via `/mnt/c/MarketData`.

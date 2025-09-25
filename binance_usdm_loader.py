@@ -260,7 +260,7 @@ def setup_logging(verbose: bool = True):
 
     if verbose:
         ch = logging.StreamHandler(sys.stdout)
-        ch.setLevel(logging.WARNING)
+        ch.setLevel(logging.INFO)
         ch.setFormatter(formatter)
         logger.addHandler(ch)
 
